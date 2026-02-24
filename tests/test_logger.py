@@ -20,7 +20,12 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("test_logger", "INFO", tmpdir)
-            assert isinstance(log, logging.Logger)
+            try:
+                assert isinstance(log, logging.Logger)
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     def test_logger_has_correct_name(self):
         """Logger should have the specified name."""
@@ -28,7 +33,12 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("my_custom_logger", "INFO", tmpdir)
-            assert log.name == "my_custom_logger"
+            try:
+                assert log.name == "my_custom_logger"
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     def test_logger_creates_log_file(self):
         """Logger should create log file in specified directory."""
@@ -37,13 +47,18 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("test_logger", "INFO", tmpdir)
-            # Get the file handler
-            file_handlers = [h for h in log.handlers if isinstance(h, logging.handlers.TimedRotatingFileHandler)]
-            assert len(file_handlers) > 0
-            # Verify the log file name is correct
-            handler = file_handlers[0]
-            log_path = Path(handler.baseFilename)
-            assert log_path.name == "test_logger.log"
+            try:
+                # Get the file handler
+                file_handlers = [h for h in log.handlers if isinstance(h, logging.handlers.TimedRotatingFileHandler)]
+                assert len(file_handlers) > 0
+                # Verify the log file name is correct
+                handler = file_handlers[0]
+                log_path = Path(handler.baseFilename)
+                assert log_path.name == "test_logger.log"
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     def test_logger_creates_directory_if_not_exists(self):
         """Logger should create log directory if it doesn't exist."""
@@ -52,8 +67,13 @@ class TestLoggerSetup:
         with tempfile.TemporaryDirectory() as tmpdir:
             new_log_dir = Path(tmpdir) / "nonexistent" / "logs"
             assert not new_log_dir.exists()
-            logger_module.setup_logger("test_logger", "INFO", str(new_log_dir))
-            assert new_log_dir.exists()
+            log = logger_module.setup_logger("test_logger", "INFO", str(new_log_dir))
+            try:
+                assert new_log_dir.exists()
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     @pytest.mark.parametrize(
         "level,expected_level",
@@ -70,7 +90,12 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("test_logger", level, tmpdir)
-            assert log.level == expected_level
+            try:
+                assert log.level == expected_level
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     def test_logger_has_console_handler(self):
         """Logger should have StreamHandler for console output."""
@@ -78,9 +103,14 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("test_logger", "INFO", tmpdir)
-            # Check for console handler (StreamHandler)
-            handler_types = [type(h).__name__ for h in log.handlers]
-            assert "StreamHandler" in handler_types
+            try:
+                # Check for console handler (StreamHandler)
+                handler_types = [type(h).__name__ for h in log.handlers]
+                assert "StreamHandler" in handler_types
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)
 
     def test_logger_has_file_handler(self):
         """Logger should have FileHandler for file output."""
@@ -88,6 +118,11 @@ class TestLoggerSetup:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = logger_module.setup_logger("test_logger", "INFO", tmpdir)
-            # Check for file handler (FileHandler or TimedRotatingFileHandler)
-            handler_types = [type(h).__name__ for h in log.handlers]
-            assert "FileHandler" in handler_types or "TimedRotatingFileHandler" in handler_types
+            try:
+                # Check for file handler (FileHandler or TimedRotatingFileHandler)
+                handler_types = [type(h).__name__ for h in log.handlers]
+                assert "FileHandler" in handler_types or "TimedRotatingFileHandler" in handler_types
+            finally:
+                for h in log.handlers[:]:
+                    h.close()
+                    log.removeHandler(h)

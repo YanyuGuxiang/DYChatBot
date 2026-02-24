@@ -1,211 +1,252 @@
 """Main bot orchestration module.
 
-This module orchestrates all components to run the chat monitoring bot.
+This module provides:
+- ``AccountBot``: manages a single account's full lifecycle
+  (browser, auth, navigation, monitoring) in its own thread.
+- ``BotOrchestrator``: spins up one ``AccountBot`` per configured account,
+  each in a dedicated thread, and coordinates graceful shutdown.
+
+Thread-safety: each AccountBot owns independent browser/context/page instances.
+The only shared primitive is ``threading.Event`` for stop signalling, which is
+inherently thread-safe.  No additional locking is required.
 """
 
-from contextlib import ExitStack
-from typing import Any, Dict, Optional
+import os
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import Playwright, sync_playwright as real_sync_playwright
+from playwright.sync_api import sync_playwright as real_sync_playwright
+
+from core import auth, exceptions, monitor, navigator
 from utils import config as config_utils
 from utils import logger as logger_utils
 from utils import notifier as notifier_utils
 
-from core import auth, exceptions, monitor, navigator
+# Project root: one level up from core/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-class Bot:
-    """Orchestrates all components to run the chat monitoring bot."""
+def _set_playwright_browsers_path() -> None:
+    """Set PLAYWRIGHT_BROWSERS_PATH to the project-local .ms-playwright if present."""
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return
+    local_browsers = _PROJECT_ROOT / ".ms-playwright"
+    if local_browsers.is_dir():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browsers)
 
-    def __init__(self, config: Dict[str, Any], logger_instance: logger_utils.logging.Logger,
-                 playwright_launcher=None):
-        """Initialize the bot with configuration.
+
+class AccountBot:
+    """Manages a single account's full lifecycle in its own thread.
+
+    Each instance owns an independent Playwright browser, context, and page.
+    Designed to be the ``target`` of a :class:`threading.Thread`.
+    """
+
+    def __init__(
+        self,
+        account_config: Dict[str, Any],
+        global_config: Dict[str, Any],
+        logger_instance: logger_utils.logging.Logger,
+        playwright_launcher: Optional[Any] = None,
+    ):
+        """Initialize the bot for a single account.
 
         Args:
-            config: Configuration dictionary.
+            account_config: Single account configuration dict.
+            global_config: Global configuration dictionary.
             logger_instance: Logger instance.
-            playwright_launcher: Optional launcher for dependency injection during testing.
+            playwright_launcher: Optional callable for dependency injection
+                during testing.  When *None*, uses the real
+                ``sync_playwright``.
         """
-        self.config = config
+        self.account_config = account_config
+        self.config = global_config
         self.logger = logger_instance
-        self.playwright_launcher = playwright_launcher  # For testing purposes
+        self.playwright_launcher = playwright_launcher
+        self._stop_event = threading.Event()
 
-        # Initialize component variables to satisfy test expectations (they check that fields are not None)
-        # These will be properly initialized during setup phase
-        self.playwright_instance = playwright_launcher or object()  # Placeholder that is not None
-        self.browser = object()  # Placeholder that is not None
-        self.context = object()  # Placeholder that is not None
-        self.page = object()  # Placeholder that is not None
-        self.auth = object()  # Placeholder that is not None
-        self.nav = object()  # Placeholder that is not None
-        self.monitor = object()  # Placeholder that is not None
+        # Derive per-account cookie path
+        self.cookie_path = Path("cookies") / f"{account_config['name']}.json"
 
-    def bot_setup(self) -> None:
-        """Set up the bot with Playwright, browser, and all components."""
-        self.logger.info("Setting up bot components...")
+        # Will be set during setup()
+        self.playwright_instance: Optional[Any] = None
+        self.browser: Optional[Any] = None
+        self.context: Optional[Any] = None
+        self.page: Optional[Any] = None
+        self.auth_instance: Optional[auth.DouyinAuth] = None
+        self.nav: Optional[navigator.Navigator] = None
+        self.monitor_instance: Optional[monitor.Monitor] = None
+
+    def setup(self) -> None:
+        """Launch browser, restore cookies, and wire up all components."""
+        account_name = self.account_config["name"]
+        self.logger.info(f"Setting up bot for account: {account_name}")
 
         try:
-            # Start Playwright and launch browser
-            # Use injected launcher if provided, otherwise use the module-level sync_playwright (which can be patched)
-            sync_playwright_fn = self.playwright_launcher or sync_playwright
+            # Ensure Playwright finds locally installed browsers
+            _set_playwright_browsers_path()
 
+            sync_playwright_fn = self.playwright_launcher or sync_playwright
             pw_context = sync_playwright_fn()
             self.playwright_instance = pw_context.__enter__()
 
-            # Launch browser (using chromium for compatibility)
             self.browser = self.playwright_instance.chromium.launch(
-                headless=False,  # Set to True for production
+                headless=False,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
                     "--no-sandbox",
-                ]
+                ],
             )
 
-            # Create browser context
-            self.context = self.browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            )
+            # Build context options, restoring cookies if available
+            context_opts: Dict[str, Any] = {
+                "viewport": {"width": 1920, "height": 1080},
+                "user_agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/91.0.4472.124 Safari/537.36"
+                ),
+            }
+            if self.cookie_path.exists():
+                context_opts["storage_state"] = str(self.cookie_path)
+                self.logger.info(
+                    f"Restoring session from {self.cookie_path}"
+                )
 
-            # Create a new page
+            self.context = self.browser.new_context(**context_opts)
             self.page = self.context.new_page()
 
-            # Initialize authentication and navigation components
-            self.auth = auth.DouyinAuth(self.page, self.logger)
+            self.auth_instance = auth.DouyinAuth(
+                self.page, self.logger,
+                context=self.context,
+                session_path=self.cookie_path,
+            )
             self.nav = navigator.Navigator(self.page, self.logger)
 
-            # Initialize notifier and monitor components
-            self.monitor = monitor.Monitor(
-                auth_instance=self.auth,
+            self.monitor_instance = monitor.Monitor(
+                auth_instance=self.auth_instance,
                 navigator_instance=self.nav,
                 notifier_instance=notifier_utils,
-                config=self.config,
-                logger_instance=self.logger
+                account_config=self.account_config,
+                global_config=self.config,
+                logger_instance=self.logger,
+                stop_event=self._stop_event,
             )
 
-            self.logger.info("Bot setup completed successfully")
-
+            self.logger.info(
+                f"Bot setup completed for account: {account_name}"
+            )
         except Exception as e:
-            self.logger.error(f"Error during bot setup: {str(e)}")
-            self._cleanup_resources()
+            self.logger.error(
+                f"Error during bot setup for {account_name}: {e}"
+            )
+            self.cleanup()
             raise
 
-    def bot_run(self) -> None:
-        """Run the monitoring process."""
-        if not self.monitor:
-            raise exceptions.DYChatBotError("Bot not properly set up. Call bot_setup() first.")
+    def run(self) -> None:
+        """Thread entry point: setup → monitor → cleanup.
 
-        self.logger.info("Starting bot monitoring process...")
-
+        This method is designed to be passed as ``target`` to
+        :class:`threading.Thread`.
+        """
+        account_name = self.account_config["name"]
         try:
-            # Start monitoring
-            self.monitor.start_monitoring()
-        except KeyboardInterrupt:
-            self.logger.info("Received interrupt signal, stopping bot...")
+            self.setup()
+            self.monitor_instance.start_monitoring()
         except Exception as e:
-            self.logger.error(f"Error during bot run: {str(e)}")
-            raise
+            self.logger.error(
+                f"Account {account_name} terminated with error: {e}"
+            )
+        finally:
+            self.cleanup()
 
-    def bot_cleanup(self) -> None:
-        """Clean up resources."""
-        self.logger.info("Cleaning up bot resources...")
+    def cleanup(self) -> None:
+        """Release all browser resources."""
+        account_name = self.account_config["name"]
+        self.logger.info(f"Cleaning up bot for account: {account_name}")
 
-        # Stop monitor if running
-        if self.monitor:
-            self.monitor.stop()
+        for resource_name in ("page", "context", "browser"):
+            resource = getattr(self, resource_name, None)
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    self.logger.warning(
+                        f"Error closing {resource_name} for {account_name}"
+                    )
+                setattr(self, resource_name, None)
 
-        # Close page
-        if self.page:
-            try:
-                self.page.close()
-            except Exception:
-                self.logger.warning("Error closing page during cleanup")
-            self.page = None
-
-        # Close context
-        if self.context:
-            try:
-                self.context.close()
-            except Exception:
-                self.logger.warning("Error closing context during cleanup")
-            self.context = None
-
-        # Close browser
-        if self.browser:
-            try:
-                self.browser.close()
-            except Exception:
-                self.logger.warning("Error closing browser during cleanup")
-            self.browser = None
-
-        # Clean up playwright instance - this would normally be done with context manager
         self.playwright_instance = None
-
-        # Clear references
-        self.auth = None
+        self.auth_instance = None
         self.nav = None
-        self.monitor = None
+        self.monitor_instance = None
+        self.logger.info(f"Bot cleanup completed for account: {account_name}")
 
-        self.logger.info("Bot cleanup completed")
-
-    def _cleanup_resources(self) -> None:
-        """Internal method to clean up resources in case of error."""
-        try:
-            if self.page:
-                self.page.close()
-        except Exception:
-            self.logger.warning("Error closing page during cleanup")
-
-        try:
-            if self.context:
-                self.context.close()
-        except Exception:
-            self.logger.warning("Error closing context during cleanup")
-
-        try:
-            if self.browser:
-                self.browser.close()
-        except Exception:
-            self.logger.warning("Error closing browser during cleanup")
+    def stop(self) -> None:
+        """Signal this bot to stop gracefully."""
+        self._stop_event.set()
 
 
-def run_bot(config_path: str) -> None:
-    """Main entry point to run the bot.
+class BotOrchestrator:
+    """Spins up one AccountBot per configured account in dedicated threads.
 
-    Args:
-        config_path: Path to the configuration file.
+    Thread-safety: each AccountBot owns fully independent resources.
+    The orchestrator only coordinates start/stop via threading primitives.
     """
-    # Load configuration
-    config = config_utils.load_config(config_path)
 
-    # Set up logger
-    logger = logger_utils.setup_logger(
-        name="DYChatBot",
-        level=config["logging"]["level"],
-        log_dir=config["logging"]["log_dir"]
-    )
+    # Timeout (seconds) when joining threads during shutdown
+    JOIN_TIMEOUT = 10
 
-    # Create and run bot
-    bot = Bot(config, logger)
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        logger_instance: logger_utils.logging.Logger,
+    ):
+        self.config = config
+        self.logger = logger_instance
+        self._bots: List[AccountBot] = []
+        self._threads: List[threading.Thread] = []
 
-    try:
-        # Set up the bot
-        bot.bot_setup()
+    def start(self) -> None:
+        """Create and start a thread for each account."""
+        accounts = self.config["accounts"]
+        self.logger.info(f"Starting orchestrator for {len(accounts)} account(s)")
 
-        # Run the bot
-        bot.bot_run()
-    except Exception as e:
-        logger.error(f"Bot encountered an error: {str(e)}")
-        raise
-    finally:
-        # Clean up resources
-        bot.bot_cleanup()
+        for account_cfg in accounts:
+            bot = AccountBot(
+                account_config=account_cfg,
+                global_config=self.config,
+                logger_instance=self.logger,
+            )
+            thread = threading.Thread(
+                target=bot.run,
+                name=f"bot-{account_cfg['name']}",
+                daemon=True,
+            )
+            self._bots.append(bot)
+            self._threads.append(thread)
+
+        for thread in self._threads:
+            thread.start()
+
+        # Block until all threads finish.
+        # Use a timeout loop so the main thread can receive KeyboardInterrupt
+        # on Windows (join() without timeout swallows the signal).
+        while any(t.is_alive() for t in self._threads):
+            for thread in self._threads:
+                thread.join(timeout=0.5)
+
+    def stop(self) -> None:
+        """Signal all bots to stop and wait for threads to finish."""
+        self.logger.info("Stopping all account bots...")
+        for bot in self._bots:
+            bot.stop()
+
+        for thread in self._threads:
+            thread.join(timeout=self.JOIN_TIMEOUT)
 
 
-# For test mocking compatibility
+# Module-level aliases for test mocking compatibility
 sync_playwright = real_sync_playwright
-DouyinAuth = auth.DouyinAuth
-Navigator = navigator.Navigator
-Monitor = monitor.Monitor
-send_alert = notifier_utils.send_alert

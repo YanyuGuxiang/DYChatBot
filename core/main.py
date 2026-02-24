@@ -59,35 +59,31 @@ def run_bot(config_path: str) -> None:
     Args:
         config_path: Path to the configuration file.
     """
-    # Load configuration
-    config = config_utils.load_config(config_path)
+    from pathlib import Path
 
-    # Set up logger
+    config = config_utils.load_config(Path(config_path))
+
     logger = logger_utils.setup_logger(
         name="DYChatBot",
         level=config["logging"]["level"],
-        log_dir=config["logging"]["log_dir"]
+        log_dir=config["logging"]["log_dir"],
     )
 
-    # Create and run bot - use the module-level Bot alias for test patching
-    bot_instance = Bot(config, logger)
+    orchestrator = BotOrchestrator(config, logger)
 
     try:
-        # Set up the bot
-        bot_instance.bot_setup()
-
-        # Run the bot
-        bot_instance.bot_run()
+        orchestrator.start()
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, stopping...")
     except Exception as e:
         logger.error(f"Bot encountered an error: {e}")
         raise
     finally:
-        # Clean up resources regardless of success or failure
-        bot_instance.bot_cleanup()
+        orchestrator.stop()
 
 
 # For test mocking compatibility - expose imports at module level
-Bot = bot.Bot
+BotOrchestrator = bot.BotOrchestrator
 config_utils = config_utils
 logger_utils = logger_utils
 

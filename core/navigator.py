@@ -25,26 +25,35 @@ class Navigator:
         self.page = page
         self.logger = logger_instance
 
-    def navigate_to_chat_list(self) -> None:
-        """Navigate to the chat list page."""
+    def navigate_to_chat_list(self, direct_url: Optional[str] = None) -> None:
+        """Navigate to the chat list page.
+
+        Args:
+            direct_url: If provided, navigate directly to this URL instead of
+                        going through the business center homepage.
+        """
         self.logger.info("Navigating to chat list page")
 
-        # Navigate to Douyin business center
-        self.page.goto("https://life.douyin.com/")
+        if direct_url:
+            # Navigate directly to the chat/message page URL
+            self.page.goto(direct_url)
+            self.page.wait_for_load_state("domcontentloaded")
+        else:
+            # Fallback: navigate via business center homepage
+            self.page.goto("https://life.douyin.com/")
+            self.page.wait_for_load_state("domcontentloaded")
 
-        # Wait for page to load
-        self.page.wait_for_load_state("domcontentloaded")
+            # Find and click the chat tab/button
+            chat_tab = self.page.get_by_role("tab", name="消息", exact=True)
+            if not chat_tab.count():
+                chat_tab = self.page.get_by_role("button", name="消息", exact=True)
 
-        # Find and click the chat tab/button
-        # Using role-based selectors for accessibility
-        chat_tab = self.page.get_by_role("tab", name="消息", exact=True)
-        if not chat_tab.count():  # If not found with role="tab", try other selectors
-            chat_tab = self.page.get_by_role("button", name="消息", exact=True)
+            chat_tab.click()
 
-        chat_tab.click()
-
-        # Wait for chat list to load
-        self.page.wait_for_selector("[data-testid='chat-list'], .chat-list-item", timeout=10000)
+            # Wait for chat list to load
+            self.page.wait_for_selector(
+                "[data-testid='chat-list'], .chat-list-item", timeout=10000
+            )
 
         self.logger.info("Successfully navigated to chat list")
 
@@ -61,8 +70,11 @@ class Navigator:
         self.logger.info("Getting unread chats")
 
         for attempt in range(max_retries):
-            # Find unread chat elements (elements with unread indicators)
-            unread_chats = self.page.locator("[data-unread='true'], .unread-chat, .unread-indicator")
+            # Find conversation items that have the unread badge visible
+            # When a chat has unread messages, its <sup> gains the class "byted-badge-sup-show"
+            unread_chats = self.page.locator(
+                'div[class*="conversationItem-"]'
+            ).filter(has=self.page.locator("sup.byted-badge-sup-show"))
             count = unread_chats.count()
 
             if count > 0:
@@ -99,6 +111,28 @@ class Navigator:
         except Exception as e:
             self.logger.error(f"Failed to open chat: {str(e)}")
             raise exceptions.NavigationError(f"Failed to open chat: {str(e)}") from e
+
+    def click_quick_reply(self, timeout: int = 5000) -> None:
+        """Click the quick-reply (售后卡片) toolbar button in the current chat.
+
+        Args:
+            timeout: Max wait time in ms for the button to appear.
+
+        Raises:
+            NavigationError: If the button is not found or click fails.
+        """
+        self.logger.info("Clicking quick reply button")
+
+        try:
+            btn = self.page.locator('[data-log-value="qyh_after_sale_card_click"]')
+            btn.wait_for(state="visible", timeout=timeout)
+            btn.click()
+            self.logger.info("Quick reply button clicked successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to click quick reply button: {e}")
+            raise exceptions.NavigationError(
+                f"Failed to click quick reply button: {e}"
+            ) from e
 
     def send_message(self, message: str) -> None:
         """Send a message in the current chat.

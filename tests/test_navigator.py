@@ -91,17 +91,23 @@ class TestGetUnreadChats:
 
         mock_page = Mock()
         mock_logger = Mock()
-        mock_page.locator = Mock()
-        mock_locator = Mock()
-        mock_locator.count.return_value = 2
-        mock_locator.nth.side_effect = [Mock(), Mock()]
-        mock_page.locator.return_value = mock_locator
+
+        # The code calls page.locator(items_sel).filter(has=page.locator(badge_sel))
+        mock_filtered = Mock()
+        mock_filtered.count.return_value = 2
+        mock_filtered.nth.side_effect = [Mock(), Mock()]
+
+        mock_items_locator = Mock()
+        mock_items_locator.filter.return_value = mock_filtered
+
+        mock_badge_locator = Mock()
+
+        mock_page.locator.side_effect = [mock_items_locator, mock_badge_locator]
 
         nav = navigator_module.Navigator(mock_page, mock_logger)
         chats = nav.get_unread_chats()
 
-        # Should use locator to find unread chats
-        mock_page.locator.assert_called()
+        mock_items_locator.filter.assert_called_once_with(has=mock_badge_locator)
         assert len(chats) == 2
 
     def test_get_unread_chats_returns_list_of_chat_elements(self):
@@ -110,22 +116,24 @@ class TestGetUnreadChats:
 
         mock_page = Mock()
         mock_logger = Mock()
-        mock_page.locator = Mock()
-        mock_locator = Mock()
-        mock_locator.count.return_value = 2
-        mock_locator_element1 = Mock()
-        mock_locator_element2 = Mock()
-        mock_locator.nth.side_effect = [mock_locator_element1, mock_locator_element2]
-        mock_page.locator.return_value = mock_locator
+
+        mock_element1 = Mock()
+        mock_element2 = Mock()
+        mock_filtered = Mock()
+        mock_filtered.count.return_value = 2
+        mock_filtered.nth.side_effect = [mock_element1, mock_element2]
+
+        mock_items_locator = Mock()
+        mock_items_locator.filter.return_value = mock_filtered
+        mock_page.locator.side_effect = [mock_items_locator, Mock()]
 
         nav = navigator_module.Navigator(mock_page, mock_logger)
         chats = nav.get_unread_chats()
 
-        # Should return a list of chat elements
         assert isinstance(chats, list)
         assert len(chats) == 2
-        assert chats[0] is mock_locator_element1
-        assert chats[1] is mock_locator_element2
+        assert chats[0] is mock_element1
+        assert chats[1] is mock_element2
 
     @patch("time.sleep", return_value=None)
     def test_get_unread_chats_with_retry_mechanism(self, mock_sleep):
@@ -134,32 +142,33 @@ class TestGetUnreadChats:
 
         mock_page = Mock()
         mock_logger = Mock()
-        mock_page.locator = Mock()
-        mock_locator_first = Mock()
-        mock_locator_first.count.return_value = 0  # No chats on first try
-        mock_locator_second = Mock()
-        mock_locator_second.count.return_value = 1  # One chat on second try
-        mock_locator_element = Mock()
-        mock_locator_second.nth.return_value = mock_locator_element
-        # Return different locators on subsequent calls
-        call_count = 0
 
-        def mock_locator_return(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return mock_locator_first
-            else:
-                return mock_locator_second
+        mock_element = Mock()
 
-        mock_page.locator.side_effect = mock_locator_return
+        # First attempt: 0 results; second attempt: 1 result
+        mock_filtered_empty = Mock()
+        mock_filtered_empty.count.return_value = 0
+
+        mock_filtered_found = Mock()
+        mock_filtered_found.count.return_value = 1
+        mock_filtered_found.nth.return_value = mock_element
+
+        mock_items_loc_1 = Mock()
+        mock_items_loc_1.filter.return_value = mock_filtered_empty
+        mock_items_loc_2 = Mock()
+        mock_items_loc_2.filter.return_value = mock_filtered_found
+
+        # Each retry calls page.locator twice (items + badge)
+        mock_page.locator.side_effect = [
+            mock_items_loc_1, Mock(),  # attempt 1
+            mock_items_loc_2, Mock(),  # attempt 2
+        ]
 
         nav = navigator_module.Navigator(mock_page, mock_logger)
         chats = nav.get_unread_chats(max_retries=3, retry_delay=0.1)
 
-        # Should retry since first attempt had 0 chats
-        assert mock_page.locator.call_count > 1
         assert len(chats) == 1
+        assert chats[0] is mock_element
 
 
 class TestOpenChat:

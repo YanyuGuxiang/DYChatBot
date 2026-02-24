@@ -12,8 +12,8 @@
 
 | 组件 | 选型 | 理由 |
 |------|------|------|
-| 浏览器自动化 | `playwright` (async API) | spec 指定；项目唯一第三方依赖 |
-| 并发模型 | `asyncio` | 标准库；每个账号一个 `BrowserContext`，通过 `asyncio.gather` 并行 |
+| 浏览器自动化 | `playwright` (sync API) | spec 指定；每个线程使用独立的同步浏览器实例 |
+| 并发模型 | `threading` | 标准库；每个账号一个独立线程 + 独立浏览器实例，通过 `threading.Thread` 并行 |
 | 配置管理 | `json`（标准库） | spec 指定 `config.json`；无需引入 pydantic 等 |
 | 日志 | `logging`（标准库） | `TimedRotatingFileHandler` 按日轮转 + `StreamHandler` 控制台 |
 | 邮件通知 | `smtplib` + `email`（标准库） | 无需第三方依赖 |
@@ -22,7 +22,7 @@
 
 ### 1.2 关键设计决策
 
-- **异步优先**: 全部使用 `playwright.async_api`，主循环为 `asyncio.run()`
+- **线程并行**: 全部使用 `playwright.sync_api`，每个账号一个 `threading.Thread`
 - **无 ORM / 无数据库**: 所有状态保持在内存中，Cookie 通过 JSON 文件持久化
 - **无抽象基类**: 遵循宪法第一条（简单性），模块间通过函数调用和数据类协作，不引入 ABC 接口层
 - **自定义异常体系**: 遵循宪法第三条，定义业务异常与系统异常的层次结构
@@ -116,14 +116,19 @@ DYChatBotError (base)
 - 职责：加载配置 → 初始化日志 → 为每个账号创建 `AccountBot` → `asyncio.gather` 并行启动
 - 依赖：`utils.config`、`utils.logger`、`core.bot`
 
-#### `core/bot.py` — AccountBot 类
+#### `core/bot.py` — AccountBot + BotOrchestrator
 
-- 职责：单账号完整生命周期编排（登录 → 导航 → 监控循环），异常重试与邮件告警的顶层协调
-- 依赖：`core.auth`、`core.navigator`、`core.monitor`、`utils.notifier`
+- 职责：
+  - `AccountBot`：单账号完整生命周期编排（启动浏览器 → 恢复 Cookie → 登录 → 导航 → 监控循环 → 清理），作为线程入口
+  - `BotOrchestrator`：为每个账号创建 `AccountBot` + `threading.Thread`，协调启动与优雅停止
+- 依赖：`core.auth`、`core.navigator`、`core.monitor`、`utils.notifier`、`threading`
 - 关键方法：
-  - `async run()`: 主循环入口
-  - `async _ensure_authenticated()`: 确保登录态有效（调用 auth 模块）
-  - `async _handle_fatal_error()`: 超过重试次数后发送邮件并停止
+  - `AccountBot.setup()`: 启动浏览器、恢复 Cookie、创建组件
+  - `AccountBot.run()`: 线程入口（setup → monitor → cleanup）
+  - `AccountBot.cleanup()`: 关闭 page/context/browser
+  - `AccountBot.stop()`: 设置 `threading.Event` 停止信号
+  - `BotOrchestrator.start()`: 创建并启动所有线程
+  - `BotOrchestrator.stop()`: 通知所有 bot 停止，join 等待线程结束
 
 #### `core/auth.py` — 登录与会话管理
 
@@ -185,10 +190,14 @@ core/exceptions.py            ← 被所有 core/ 和 utils/ 模块引用（无�
 
 ### 3.5 并发模型
 
-- 每个账号对应一个 `AccountBot` 实例，通过 `asyncio.gather(*tasks, return_exceptions=True)` 并行运行
-- 单个账号异常不影响其他账号（`return_exceptions=True` + 各 Bot 内部 try/except）
+- 每个账号对应一个 `AccountBot` 实例，通过 `threading.Thread` 在独立线程中并行运行
+- `BotOrchestrator.start()` 创建并启动所有线程，`join()` 等待完成
+- 单个账号异常不影响其他账号（各线程内部 try/except）
 - 各 Bot 实例之间无共享状态，无需锁机制
-- 竞态条件风险：**无**。各账号独立浏览器实例、独立 Cookie 文件、独立日志 logger name，不存在共享可变状态
+- `threading.Event` 用于停止信号，天然线程安全
+- Cookie 文件按账号名隔离（`cookies/{name}.json`），无文件竞争
+- `logging` 模块内部有锁，线程安全
+- 竞态条件风险：**无**。各账号独立浏览器实例、独立 Cookie 文件，不存在共享可变状态
 
 ### 3.6 重试策略
 
@@ -206,21 +215,29 @@ core/exceptions.py            ← 被所有 core/ 和 utils/ 模块引用（无�
 ### 4.1 Cookie 持久化方案
 
 ```
-登录成功 → context.storage_state(path="cookies/{name}.json")
-下次启动 → browser.new_context(storage_state="cookies/{name}.json")
-恢复后验证 → 访问首页，检查是否跳转到登录页
-验证失败 → 删除 cookie 文件，走账号密码登录流程
+启动 → cookies/ 目录自动创建（save_session 中 mkdir）
+     → cookies/{name}.json 存在？
+        是 → browser.new_context(storage_state=cookie_path) 恢复
+        否 → browser.new_context() 空白上下文
+     → 导航到 direct_url
+     → check_session() 检查登录态
+        有效 → 进入监控循环
+        失效 → delete_cookie() 删除旧文件
+              → perform_login() → wait_for_login_success()
+              → save_session() 保存新 cookie 到 cookies/{name}.json
 ```
 
 ### 4.2 登录态失效被动检测
 
-在 `monitor.py` 的每次轮询操作中，若出现以下任一情况，抛出 `SessionExpiredError`：
+在 `monitor.py` 的每次轮询中，`auth.check_session()` 检测以下情况：
 
-1. 元素等待超时（可能是页面已跳转）
-2. 当前 URL 包含 `/login`
-3. 页面存在 `//div[text()="登录抖音来客"]` 元素
+1. 当前 URL 包含 `sso.douyin.com` 或 `passport.douyin.com`
+2. 页面存在 `[class*='LoginCard']` 或 `p:has-text('立即登录')` 元素
 
-`bot.py` 捕获 `SessionExpiredError` 后触发重新登录流程。
+检测到失效后，Monitor 调用 `_reauthenticate_account()`：
+- 尝试重新登录（最多 `login_max_retries` 次）
+- 全部失败时调用 `auth.delete_cookie()` 删除旧 cookie 文件
+- 抛出 `AuthError`
 
 ### 4.3 新标签页处理
 

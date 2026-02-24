@@ -4,9 +4,10 @@ This module handles login and session management for Douyin accounts.
 """
 
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
-from playwright.sync_api import Page
+from playwright.sync_api import BrowserContext, Page
 
 from core import exceptions
 from utils import logger
@@ -15,18 +16,34 @@ from utils import logger
 class DouyinAuth:
     """Handles Douyin authentication and session management."""
 
-    def __init__(self, page: Page, logger_instance: logger.logging.Logger):
+    def __init__(
+        self,
+        page: Page,
+        logger_instance: logger.logging.Logger,
+        context: Optional[BrowserContext] = None,
+        session_path: Optional[Path] = None,
+    ):
         """Initialize the authenticator.
 
         Args:
             page: Playwright Page instance.
             logger_instance: Logger instance.
+            context: Playwright BrowserContext (needed for storage_state).
+            session_path: File path to persist session cookies.
         """
         self.page = page
         self.logger = logger_instance
+        self.context = context
+        self.session_path = session_path
 
     def perform_login(self, credentials: dict[str, str]) -> None:
         """Perform login with provided credentials.
+
+        The method assumes the page is already showing a login/register page
+        on life.douyin.com (抖音来客).  The login flow requires:
+        1. Click "立即登录" to switch from register to login view
+        2. Click "密码登录" to switch from SMS to password mode
+        3. Fill username and password, then submit
 
         Args:
             credentials: Dictionary containing 'username' and 'password'.
@@ -34,38 +51,67 @@ class DouyinAuth:
         Raises:
             AuthError: If credentials are invalid or login fails.
         """
-        # Validate credentials
         if not credentials.get("username") or not credentials.get("password"):
             raise exceptions.AuthError("Username and password cannot be empty")
 
         self.logger.info(f"Attempting login for account: {credentials['username']}")
 
-        # Navigate to login page
-        # Douyin login URL (adjust if needed based on current login flow)
-        self.page.goto("https://sso.douyin.com/login")
+        # Step 1: Click "立即登录" to enter login mode (if visible)
+        try:
+            login_link = self.page.locator("p:has-text('立即登录')")
+            login_link.wait_for(state="visible", timeout=5000)
+            login_link.click()
+            self.logger.info("Clicked '立即登录'")
+        except Exception:
+            self.logger.debug("'立即登录' not found or already on login form")
 
-        # Wait for login form to load
-        self.page.wait_for_selector("[placeholder*='手机号/邮箱/抖音号'], [placeholder*='Password']")
+        # Step 2: Click "密码登录" to switch to password mode
+        try:
+            pwd_tab = self.page.locator("div.switch-tip:has-text('密码登录')")
+            pwd_tab.wait_for(state="visible", timeout=5000)
+            pwd_tab.click()
+            self.logger.info("Clicked '密码登录'")
+        except Exception:
+            self.logger.debug("'密码登录' tab not found, may already be in password mode")
 
-        # The test expects these exact calls to get_by_role in sequence:
-        # First call gets username input element
-        username_input = self.page.get_by_role("textbox", name="手机号/邮箱/抖音号")
-        # Second call gets password input element
-        password_input = self.page.get_by_role("textbox", name="密码")
-        # Third call gets login button
-        login_button = self.page.get_by_role("button", name="登录", exact=True)
+        # Step 3: Wait for password input to become visible
+        self.page.locator("input[placeholder='密码']").first.wait_for(
+            state="visible", timeout=10000
+        )
 
-        # Fill credentials
+        # Step 4: Fill credentials
+        username_input = self.page.locator(
+            "input[placeholder*='手机号'], input[placeholder*='邮箱'], "
+            "input[placeholder*='抖音号']"
+        ).first
+        password_input = self.page.locator(
+            "input[placeholder='密码']"
+        ).first
+
         username_input.fill(credentials["username"])
         password_input.fill(credentials["password"])
 
-        # Click login button
+        # Step 5: Check the agreement checkbox (已阅读并同意)
+        # The actual <input> is visually hidden; click the visible <label> instead.
+        try:
+            checkbox_label = self.page.locator("label.life-core-checkbox").first
+            checkbox_label.click()
+            self.logger.info("Checked agreement checkbox")
+        except Exception:
+            self.logger.debug("Agreement checkbox not found or already checked")
+
+        # Step 6: Click login button
+        login_button = self.page.locator("button:has-text('登录')").first
         login_button.click()
 
         self.logger.info("Login credentials submitted")
 
     def wait_for_login_success(self, max_attempts: int = 60, sleep_interval: float = 1.0) -> None:
-        """Wait for login to complete by monitoring URL change.
+        """Wait for login to complete.
+
+        Detects success by checking that login-form elements have
+        disappeared from the page (works for both embedded forms on
+        life.douyin.com and SSO redirects).
 
         Args:
             max_attempts: Maximum number of attempts to check for login success.
@@ -76,63 +122,106 @@ class DouyinAuth:
         """
         self.logger.info("Waiting for login to complete...")
 
+        login_selectors = (
+            "input[placeholder*='手机号'],"
+            "input[placeholder*='密码'],"
+            "input[placeholder*='Password']"
+        )
+
         for attempt in range(max_attempts):
-            current_url = self.page.url
+            # If no login-form inputs remain, login succeeded
+            try:
+                if self.page.locator(login_selectors).count() == 0:
+                    self.logger.info("Login successful")
+                    return
+            except Exception:
+                pass
 
-            # If we're on the business center or home page, login was successful
-            if "life.douyin.com" in current_url or "douyin.com" in current_url and "sso" not in current_url:
-                self.logger.info("Login successful")
-                return
-
-            self.logger.debug(f"Login attempt {attempt + 1}: Still on login page, URL: {current_url}")
+            self.logger.debug(
+                f"Login attempt {attempt + 1}: login form still visible"
+            )
             time.sleep(sleep_interval)
 
-        # If we've exhausted our attempts
         raise exceptions.AuthError(
-            f"Login verification timed out after {max_attempts * sleep_interval:.1f} seconds. "
+            f"Login verification timed out after "
+            f"{max_attempts * sleep_interval:.1f} seconds. "
             f"Current URL: {self.page.url}"
         )
 
     def check_session(self, direct_url: str) -> bool:
-        """Check if current session is still valid by navigating to direct URL.
+        """Check if current session is still valid on the current page.
+
+        Only inspects the current page state (URL + DOM).
+        Does NOT call page.goto() — the caller is responsible for
+        navigating to the correct page beforehand.
 
         Args:
-            direct_url: Direct URL to navigate to for session check.
+            direct_url: Not used for navigation; kept for API compatibility.
 
         Returns:
             True if session is expired, False if session is still valid.
         """
-        self.logger.info(f"Checking session validity by navigating to: {direct_url}")
+        self.logger.debug("Checking session validity on current page")
 
-        # Navigate to the direct URL
-        self.page.goto(direct_url)
-
-        # Wait briefly for page to load
-        self.page.wait_for_timeout(2000)
-
-        # Check if we're still on the login page (indicating expired session)
         current_url = self.page.url
 
-        # Check if current_url is a mock object by seeing if it has typical mock attributes
-        if hasattr(current_url, 'return_value') or hasattr(current_url, '_spec_class') or \
-           str(type(current_url).__name__) in ['Mock', 'MagicMock', 'NonCallableMock']:
-            # In a test environment with Mock objects, just return False (session not expired)
-            # since the test will handle the specific mock behaviors
-            self.logger.info("Session is still valid")
-            return False  # Session is not expired
-
-        # If current_url is a string-like object, check it normally
+        # --- URL-based check ---
+        login_url_markers = ("sso.douyin.com", "passport.douyin.com")
         try:
-            # Check if we're on login-related URLs (indicating expired session)
-            if "sso.douyin.com" in current_url or "passport.douyin.com" in current_url:
-                self.logger.warning("Session appears to be expired, redirected to login page")
-                return True  # Session is expired
+            if any(marker in current_url for marker in login_url_markers):
+                self.logger.warning(
+                    f"Session expired: on login page (URL: {current_url})"
+                )
+                return True
         except TypeError:
-            # Handle case where current_url is not string-like (like a Mock object)
-            # In this case, assume session is not expired
             self.logger.info("Session is still valid")
             return False
 
-        # If we're on the expected page or business center, session is still valid
+        # --- Page-content check ---
+        # Use the login card container class unique to the login page,
+        # not generic input selectors which may match chat page elements.
+        login_selectors = [
+            "[class*='LoginCard']",
+            "p:has-text('立即登录')",
+        ]
+        for selector in login_selectors:
+            try:
+                if self.page.locator(selector).count() > 0:
+                    self.logger.warning(
+                        f"Session expired: login element detected "
+                        f"(selector: {selector})"
+                    )
+                    return True
+            except Exception:
+                continue
+
         self.logger.info("Session is still valid")
-        return False  # Session is not expired
+        return False
+
+    def save_session(self) -> None:
+        """Save browser session (cookies/storage) to disk."""
+        if not self.context or not self.session_path:
+            return
+        try:
+            self.session_path.parent.mkdir(parents=True, exist_ok=True)
+            self.context.storage_state(path=str(self.session_path))
+            self.logger.info(f"Session saved to {self.session_path}")
+        except Exception as e:
+            self.logger.warning(f"Failed to save session: {e}")
+
+    def delete_cookie(self) -> None:
+        """Delete the cookie file for this account.
+
+        Called when session validation fails to ensure stale cookies
+        are removed before re-authentication.
+        """
+        if not self.session_path:
+            return
+        try:
+            if self.session_path.exists():
+                self.session_path.unlink()
+                self.logger.info(f"Deleted cookie file: {self.session_path}")
+            else:
+                self.logger.debug(f"Cookie file not found, nothing to delete: {self.session_path}")
+        except OSError as e:
+            self.logger.warning(f"Failed to delete cookie file {self.session_path}: {e}")

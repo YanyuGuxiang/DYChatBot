@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+logs/
 
 # Virtual environments
 .venv
@@ -15,3 +16,8 @@ wheels/
 # IDE配置（如PyCharm）
 .idea/
 .vscode/
+.claude/settings.local.json
+.ms-playwright/
+cookies/
+.pytest_cache/
+config.json
