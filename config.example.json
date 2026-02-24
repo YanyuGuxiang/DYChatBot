@@ -1,0 +1,37 @@
+{
+  "accounts": [
+    {
+      "name": "店铺A",
+      "username": "account1",
+      "password": "password1",
+      "direct_url": "https://life.douyin.com/cs/web/xxx"
+    },
+    {
+      "name": "店铺B",
+      "username": "account2",
+      "password": "password2",
+      "direct_url": "https://life.douyin.com/cs/web/yyy"
+    }
+  ],
+  "monitor": {
+    "user_list_size": 10,
+    "poll_interval_seconds": 1
+  },
+  "retry": {
+    "login_max_retries": 3,
+    "element_wait_timeout_seconds": 30,
+    "element_max_retries": 3
+  },
+  "email": {
+    "enabled": true,
+    "smtp_host": "smtp.qq.com",
+    "smtp_port": 465,
+    "sender": "your-email@qq.com",
+    "auth_code": "your-auth-code",
+    "receivers": ["admin@example.com"]
+  },
+  "logging": {
+    "level": "INFO",
+    "log_dir": "logs"
+  }
+}
